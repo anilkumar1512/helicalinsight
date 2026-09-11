@@ -13,6 +13,12 @@
     <context:component-scan base-package="com.helicalinsight"/>
     <util:properties id="projectProperties" location="classpath:project.properties"/>
 
+    <!-- MongoDB NoSql loaders: aliases route all known MongoDB driver class names
+         to the native MongoDBLoader bean so that NoSqlUtils.getNoSqlImplementation()
+         can resolve them for connection testing and middleware loading -->
+    <alias name="mongodb.jdbc.MongoDriver" alias="com.helical.mongodb.MongoJdbcDriver"/>
+    <alias name="mongodb.jdbc.MongoDriver" alias="cdata.jdbc.mongodb.MongoDBDriver"/>
+
     <!-- Root Context: defines shared resources visible to all other web components -->
     <!-- A high performance connection pool -->
     <bean id="dataSource" class="com.zaxxer.hikari.HikariDataSource" destroy-method="close">

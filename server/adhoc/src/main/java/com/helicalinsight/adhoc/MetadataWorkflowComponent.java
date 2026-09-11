@@ -8,6 +8,9 @@ import com.google.gson.JsonSyntaxException;
 import com.helicalinsight.adhoc.metadata.genericdb.*;
 import com.helicalinsight.datasource.ConnectionProviderFactory;
 import com.helicalinsight.datasource.DriverConnection;
+import com.helicalinsight.datasource.GsonUtility;
+import com.helicalinsight.datasource.nosql.MongoDBLoader;
+import com.helicalinsight.efw.framework.utils.ApplicationContextAccessor;
 import com.helicalinsight.efw.HIManagedThread;
 import com.helicalinsight.efw.exceptions.MalformedJsonException;
 import com.helicalinsight.efw.exceptions.RequiredParameterIsNullException;
@@ -82,6 +85,15 @@ public class MetadataWorkflowComponent implements IComponent {
         try {
             //noinspection ConstantConditions
             connection = driverConnection.getConnection();
+
+            // MongoDB and other NoSQL datasources do not return a JDBC connection.
+            // Fetch the metadata directly from the MongoDB server using the native loader.
+            String driverClass = driverConnection.getDriverClass();
+            if (connection == null && driverClass != null
+                    && (driverClass.contains("mongo") || driverClass.contains("Mongo"))) {
+                return executeMongoMetadata(parameters, formJson, driverClass, metadata, response);
+            }
+
             DatabaseMetaData databaseMetaData = connection.getMetaData();
 
             addCatalogs(parameters, metadata, databaseMetaData);
@@ -451,6 +463,144 @@ public class MetadataWorkflowComponent implements IComponent {
             throw new MetadataRetrievalException(ex);
         }
     }
+    /**
+     * Builds the metadata response tree (catalogs -> schemas -> tables/collections)
+     * for Mongo-based datasources that do not expose a JDBC connection.
+     *
+     * @param parameters   JsonObject containing the expand request parameters
+     * @param formJson     JsonObject containing the datasource connection details
+     * @param driverClass  the resolved MongoDB driver class name
+     * @param metadata     metadata JsonObject which is populated
+     * @param response     response JsonObject which is returned to the client
+     * @return the serialized metadata response
+     */
+    @NotNull
+    private String executeMongoMetadata(@NotNull JsonObject parameters, @NotNull JsonObject formJson,
+                                        @NotNull String driverClass, @NotNull JsonObject metadata,
+                                        @NotNull JsonObject response) {
+        MongoDBLoader mongoDBLoader;
+        mongoDBLoader = (MongoDBLoader) ApplicationContextAccessor.getBean(driverClass);
+
+        if (parameters.has("fetchCatalogs") && parameters.get("fetchCatalogs").getAsBoolean()) {
+            JsonArray catalogs = new JsonArray();
+            List<String> databases = mongoDBLoader.getDatabases(formJson);
+            if (databases != null) {
+                String databaseName = null;
+                if (formJson.has("database")) {
+                    databaseName = GsonUtility.optString(formJson, "database");
+                }
+                for (String database : databases) {
+                    JsonObject catalogJson = new JsonObject();
+                    catalogJson.addProperty("name", database);
+                    catalogJson.addProperty("id", database);
+                    catalogs.add(catalogJson);
+                }
+            }
+            metadata.add("catalogs", catalogs);
+        }
+
+        if (parameters.has("fetchSchemas") && parameters.get("fetchSchemas").getAsBoolean()) {
+            String databaseName = null;
+            if (formJson.has("database")) {
+                databaseName = GsonUtility.optString(formJson, "database");
+            }
+            List<String> collections = mongoDBLoader.getCollections(formJson);
+            JsonArray schemas = new JsonArray();
+            if (collections != null) {
+                JsonObject schemaJson = new JsonObject();
+                schemaJson.addProperty("name", databaseName);
+                JsonArray tables = new JsonArray();
+                for (String collection : collections) {
+                    tables.add(collection);
+                }
+                schemaJson.add("tables", tables);
+                schemas.add(schemaJson);
+            }
+            metadata.add("schemas", schemas);
+        }
+
+        if (parameters.has("fetchData")) {
+            JsonArray fetchData = parameters.getAsJsonArray("fetchData");
+            JsonArray allCatalogs = new JsonArray();
+            for (Object object : fetchData) {
+                JsonObject json = new Gson().fromJson((JsonObject) object, JsonObject.class);
+                String catalog = null;
+                try {
+                    if (json.has("catalog")) {
+                        catalog = json.get("catalog").getAsString();
+                    }
+                } catch (JsonSyntaxException ex) {
+                    throw new MalformedJsonException("Error in retrieving metadata. The " +
+                            "parameter catalog should be a string if present.");
+                }
+
+                JsonObject singleCatalog = new JsonObject();
+                singleCatalog.addProperty("name", catalog);
+                JsonArray schemas = json.has("schemas") ? json.getAsJsonArray("schemas") : new JsonArray();
+                JsonArray allSchemas = new JsonArray();
+                if (schemas.size() > 0) {
+                    for (JsonElement schemaElement : schemas) {
+                        JsonObject schemaJson = schemaElement.getAsJsonObject();
+                        String schemaName = schemaJson.has("name") ? schemaJson.get("name").getAsString() : catalog;
+                        JsonArray tablesJson = schemaJson.has("tables") ? schemaJson.getAsJsonArray("tables") : new JsonArray();
+                        JsonObject singleSchema = new JsonObject();
+                        singleSchema.addProperty("name", schemaName);
+                        if (isColumnsRequested(parameters)) {
+                            JsonArray allTables = new JsonArray();
+                            for (JsonElement tableElement : tablesJson) {
+                                String collectionName = tableElement.getAsString();
+                                JsonObject tableJson = new JsonObject();
+                                tableJson.addProperty("name", collectionName);
+                                tableJson.add("columns", mongoColumns(mongoDBLoader, formJson, schemaName, collectionName));
+                                allTables.add(tableJson);
+                            }
+                            singleSchema.add("tables", allTables);
+                        } else {
+                            singleSchema.add("tables", tablesJson);
+                        }
+                        allSchemas.add(singleSchema);
+                    }
+                }
+                singleCatalog.add("schemas", allSchemas);
+                allCatalogs.add(singleCatalog);
+            }
+            if (parameters.has("view") && "tree".equalsIgnoreCase(GsonUtility.optString(parameters, "view"))) {
+                metadata.remove("catalogs");
+                metadata.add("catalogs", allCatalogs);
+            } else {
+                metadata.add("catalogs", allCatalogs);
+            }
+        }
+
+        response.addProperty("classifier", formJson.get("classifier").getAsString());
+        response.add("metadata", metadata);
+        return response.toString();
+    }
+
+    /**
+     * Infers the field (column) names of a MongoDB collection from a sample document.
+     *
+     * @param mongoDBLoader  the MongoDB loader instance
+     * @param formJson       JsonObject with the connection details
+     * @param databaseName   MongoDB database name
+     * @param collectionName MongoDB collection name
+     * @return a JsonArray of column definitions
+     */
+    private JsonArray mongoColumns(MongoDBLoader mongoDBLoader, JsonObject formJson,
+                                   String databaseName, String collectionName) {
+        JsonArray columns = new JsonArray();
+        List<String> fields = mongoDBLoader.getFields(formJson, databaseName, collectionName);
+        if (fields != null) {
+            for (String field : fields) {
+                JsonObject column = new JsonObject();
+                column.addProperty("name", field);
+                column.addProperty("type", "other");
+                columns.add(column);
+            }
+        }
+        return columns;
+    }
+
     /**
      * Indicates whether this component is thread-safe to be cached.
      * @return {@code true} if the component is thread-safe to be cached.
